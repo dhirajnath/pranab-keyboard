@@ -1,46 +1,64 @@
+mod font_engine;
+
+use font_engine::{
+    scan_installed_assamese_fonts, shape_unicode_for_profile, DetectedFontProfile, FontStandard,
+};
 use once_cell::sync::Lazy;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT, VK_SPACE,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, SetWindowsHookExW,
-    TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    SetWindowsHookExW, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
+    WM_SYSKEYDOWN,
 };
 
 #[derive(Clone, Serialize)]
 pub struct ImeState {
     pub enabled: bool,
-    pub layout: String,   // "phonetic" | "smart_assamese" | "ai_mode"
-    pub encoding: String, // "unicode" | "legacy"
+    pub layout: String,         // "phonetic" | "smart"
+    pub active_font_id: String, // e.g., "builtin_ramdhenu" or "auto_unicode"
+    pub active_app: String,
 }
 
 struct EngineContext {
     state: ImeState,
+    installed_fonts: Vec<DetectedFontProfile>,
+    per_app_font_memory: HashMap<String, String>,
     buffer: String,
-    word_raw: String,
+    word_unicode: String,
+    word_emitted_len: usize,
     prev_was_consonant: bool,
-    last_unicode_char: String,
     app_handle: Option<AppHandle>,
 }
 
 static ENGINE: Lazy<Mutex<EngineContext>> = Lazy::new(|| {
+    let fonts = scan_installed_assamese_fonts();
     Mutex::new(EngineContext {
         state: ImeState {
             enabled: false,
             layout: "phonetic".into(),
-            encoding: "unicode".into(),
+            active_font_id: "builtin_ramdhenu".into(),
+            active_app: "Desktop".into(),
         },
+        installed_fonts: fonts,
+        per_app_font_memory: HashMap::new(),
         buffer: String::new(),
-        word_raw: String::new(),
+        word_unicode: String::new(),
+        word_emitted_len: 0,
         prev_was_consonant: false,
-        last_unicode_char: String::new(),
         app_handle: None,
     })
 });
@@ -48,19 +66,45 @@ static ENGINE: Lazy<Mutex<EngineContext>> = Lazy::new(|| {
 static HOOK_HANDLE_RAW: AtomicIsize = AtomicIsize::new(0);
 static IS_INJECTING: AtomicBool = AtomicBool::new(false);
 
-fn clear_composition(ctx: &mut EngineContext) {
-    ctx.buffer.clear();
-    ctx.word_raw.clear();
-    ctx.prev_was_consonant = false;
-    ctx.last_unicode_char.clear();
-}
-
 fn get_hook_handle() -> HHOOK {
     HHOOK(HOOK_HANDLE_RAW.load(Ordering::SeqCst) as *mut core::ffi::c_void)
 }
 
 fn is_key_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+fn get_foreground_exe_name() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return "Desktop".into();
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return "Desktop".into();
+        }
+        if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut buf = [0u16; 260];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut size,
+            )
+            .is_ok();
+            let _ = CloseHandle(handle);
+            if ok && size > 0 {
+                let full_path = String::from_utf16_lossy(&buf[..size as usize]);
+                if let Some(exe) = full_path.rsplit('\\').next() {
+                    return exe.to_string();
+                }
+            }
+        }
+        "Desktop".into()
+    }
 }
 
 fn send_text(text: &str, backspaces: usize) {
@@ -163,226 +207,39 @@ fn vk_to_char(vk: u32, shift: bool) -> Option<char> {
     }
 }
 
-fn is_navigation_key(vk: u32) -> bool {
-    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E)
-}
-
-fn unicode_to_legacy_ascii(uni: &str) -> String {
-    let mut out = String::new();
-    for ch in uni.chars() {
-        let mapped = match ch {
-            'অ' => "A",
-            'আ' => "Av",
-            'ই' => "B",
-            'ঈ' => "C",
-            'উ' => "D",
-            'ঊ' => "E",
-            'ঋ' => "F",
-            'এ' => "G",
-            'ঐ' => "H",
-            'ও' => "I",
-            'ঔ' => "J",
-            'ক' => "K",
-            'খ' => "L",
-            'গ' => "M",
-            'ঘ' => "N",
-            'ঙ' => "O",
-            'চ' => "P",
-            'ছ' => "Q",
-            'জ' => "R",
-            'ঝ' => "S",
-            'ঞ' => "T",
-            'ট' => "U",
-            'ঠ' => "V",
-            'ড' => "W",
-            'ঢ' => "X",
-            'ণ' => "Y",
-            'ত' => "Z",
-            'থ' => "_",
-            'দ' => "`",
-            'ধ' => "a",
-            'ন' => "b",
-            'প' => "c",
-            'ফ' => "d",
-            'ব' => "e",
-            'ভ' => "f",
-            'ম' => "g",
-            'য' => "h",
-            'ৰ' => "i",
-            'ল' => "j",
-            'ৱ' => "k",
-            'শ' => "l",
-            'ষ' => "m",
-            'স' => "n",
-            'হ' => "o",
-            'ড়' => "p",
-            'ঢ়' => "q",
-            'য়' => "r",
-            'ৎ' => "r",
-            'া' => "v",
-            'ি' => "w",
-            'ী' => "x",
-            'ু' => "y",
-            'ূ' => "~",
-            'ৃ' => "…",
-            'ে' => "‡",
-            'ৈ' => "‰",
-            'ো' => "‡v",
-            'ৌ' => "‡Š",
-            '্' => "&",
-            'ং' => "s",
-            'ঃ' => "t",
-            'ঁ' => "u",
-            '।' => "|",
-            '০' => "0",
-            '১' => "1",
-            '২' => "2",
-            '৩' => "3",
-            '৪' => "4",
-            '৫' => "5",
-            '৬' => "6",
-            '৭' => "7",
-            '৮' => "8",
-            '৯' => "9",
-            other => {
-                out.push(other);
-                continue;
-            }
-        };
-        out.push_str(mapped);
-    }
-    out
-}
-
-fn translate_chart_phonetic(ch: char) -> Option<(&'static str, bool)> {
-    match ch {
-        '`' => Some(("ং", false)),
-        '1' => Some(("১", false)),
-        '2' => Some(("২", false)),
-        '3' => Some(("৩", false)),
-        '4' => Some(("৪", false)),
-        '5' => Some(("৫", false)),
-        '6' => Some(("৬", false)),
-        '7' => Some(("৭", false)),
-        '8' => Some(("৮", false)),
-        '9' => Some(("৯", false)),
-        '0' => Some(("০", false)),
-        '-' => Some(("-", false)),
-        '=' => Some(("ৃ", false)),
-
-        'q' => Some(("ৌ", false)),
-        'w' => Some(("ৈ", false)),
-        'e' => Some(("া", false)),
-        'r' => Some(("ী", false)),
-        't' => Some(("ূ", false)),
-        'y' => Some(("ব", false)),
-        'u' => Some(("হ", false)),
-        'i' => Some(("গ", false)),
-        'o' => Some(("দ", false)),
-        'p' => Some(("জ", false)),
-        '[' => Some(("ড", false)),
-        ']' => Some(("়", false)),
-        '\\' => Some(("য", false)),
-
-        'a' => Some(("ো", false)),
-        's' => Some(("ে", false)),
-        'd' => Some(("্", false)),
-        'f' => Some(("ি", false)),
-        'g' => Some(("ু", false)),
-        'h' => Some(("প", false)),
-        'j' => Some(("ৰ", false)),
-        'k' => Some(("ক", false)),
-        'l' => Some(("ত", false)),
-        ';' => Some(("চ", false)),
-        '\'' => Some(("ট", false)),
-
-        'z' => Some(("্ৰ", false)),
-        'x' => Some(("ং", false)),
-        'c' => Some(("ম", false)),
-        'v' => Some(("ন", false)),
-        'b' => Some(("ৱ", false)),
-        'n' => Some(("ল", false)),
-        'm' => Some(("স", false)),
-        ',' => Some((",", false)),
-        '.' => Some((".", false)),
-        '/' => Some(("য়", false)),
-
-        '~' => Some(("‘", false)),
-        '!' => Some(("হ্ম", false)),
-        '@' => Some(("’", false)),
-        '#' => Some((":", false)),
-        '$' => Some(("/", false)),
-        '%' => Some((";", false)),
-        '^' => Some(("ত্ৰ", false)),
-        '&' => Some(("ক্ষ", false)),
-        '*' => Some(("জ্ঞ", false)),
-        '(' => Some(("(", false)),
-        ')' => Some((")", false)),
-        '_' => Some(("ঃ", false)),
-        '+' => Some(("ঋ", false)),
-
-        'Q' => Some(("ঔ", false)),
-        'W' => Some(("ঐ", false)),
-        'E' => Some(("আ", false)),
-        'R' => Some(("ঈ", false)),
-        'T' => Some(("ঊ", false)),
-        'Y' => Some(("ভ", false)),
-        'U' => Some(("ঙ", false)),
-        'I' => Some(("ঘ", false)),
-        'O' => Some(("ধ", false)),
-        'P' => Some(("ঝ", false)),
-        '{' => Some(("ঢ", false)),
-        '}' => Some(("ঞ", false)),
-        '|' => Some(("ৎ", false)),
-
-        'A' => Some(("ও", false)),
-        'S' => Some(("এ", false)),
-        'D' => Some(("অ", false)),
-        'F' => Some(("ই", false)),
-        'G' => Some(("উ", false)),
-        'H' => Some(("ফ", false)),
-        'J' => Some(("ৰ", false)),
-        'K' => Some(("খ", false)),
-        'L' => Some(("থ", false)),
-        ':' => Some(("ছ", false)),
-        '"' => Some(("ঠ", false)),
-
-        'Z' => Some(("ৰ্", true)),
-        'X' => Some(("ঁ", false)),
-        'C' => Some(("ণ", false)),
-        'V' => Some(("V", false)),
-        'B' => Some(("B", false)),
-        'N' => Some(("ঙ্গ", false)),
-        'M' => Some(("শ", false)),
-        '<' => Some(("ষ", false)),
-        '>' => Some(("।", false)),
-        '?' => Some(("?", false)),
-
-        _ => None,
-    }
-}
-
-fn translate_smart_assamese(
+/// Smart Mode: Natural Romanized Transliteration
+fn translate_smart_mode(
     combo: &str,
     single: char,
     after_consonant: bool,
 ) -> Option<(String, usize, bool)> {
-    let digraph = match combo {
+    let lower_combo = combo.to_ascii_lowercase();
+
+    match lower_combo.as_str() {
+        "ksh" => return Some(("ক্ষ".to_string(), 2, true)),
+        "jny" | "gya" => return Some(("জ্ঞ".to_string(), 2, true)),
+        "shr" => return Some(("শ্ৰ".to_string(), 2, true)),
+        "ngk" => return Some(("ঙ্ক".to_string(), 2, true)),
+        "ngg" => return Some(("ঙ্গ".to_string(), 2, true)),
+        _ => {}
+    }
+
+    let digraph = match lower_combo.as_str() {
         "kh" => Some(("খ", 1, true)),
         "gh" => Some(("ঘ", 1, true)),
         "ng" => Some(("ঙ", 1, true)),
         "ch" => Some(("ছ", 1, true)),
         "jh" => Some(("ঝ", 1, true)),
-        "Th" => Some(("ঠ", 1, true)),
-        "Dh" => Some(("ঢ", 1, true)),
+        "th" if combo.starts_with('T') => Some(("ঠ", 1, true)),
+        "dh" if combo.starts_with('D') => Some(("ঢ", 1, true)),
         "th" => Some(("থ", 1, true)),
         "dh" => Some(("ধ", 1, true)),
         "ph" => Some(("ফ", 1, true)),
         "bh" => Some(("ভ", 1, true)),
+        "sh" if combo.starts_with('S') => Some(("ষ", 1, true)),
         "sh" => Some(("শ", 1, true)),
-        "Sh" => Some(("ষ", 1, true)),
-        "Rh" => Some(("ঢ়", 1, true)),
-        "kS" => Some(("ক্ষ", 1, true)),
+        "rh" if combo.starts_with('R') => Some(("ঢ়", 1, true)),
+        "hm" => Some(("হ্ম", 1, true)),
         "aa" => Some((
             if after_consonant { "া" } else { "আ" },
             if after_consonant { 0 } else { 1 },
@@ -404,30 +261,30 @@ fn translate_smart_assamese(
     }
 
     let consonant = match single {
-        'k' => Some("ক"),
-        'g' => Some("গ"),
-        'c' => Some("চ"),
-        'j' => Some("জ"),
+        'k' | 'K' => Some("ক"),
+        'g' | 'G' => Some("গ"),
+        'c' | 'C' => Some("চ"),
+        'j' | 'J' => Some("জ"),
         'T' => Some("ট"),
         'D' => Some("ড"),
         'N' => Some("ণ"),
         't' => Some("ত"),
         'd' => Some("দ"),
         'n' => Some("ন"),
-        'p' => Some("প"),
-        'f' => Some("ফ"),
-        'b' => Some("ব"),
-        'v' => Some("ভ"),
-        'm' => Some("ম"),
-        'z' => Some("য"),
+        'p' | 'P' => Some("প"),
+        'f' | 'F' => Some("ফ"),
+        'b' | 'B' => Some("ব"),
+        'v' | 'V' => Some("ভ"),
+        'm' | 'M' => Some("ম"),
+        'z' | 'Z' => Some("য"),
         'r' => Some("ৰ"),
-        'l' => Some("ল"),
-        'w' => Some("ৱ"),
-        's' => Some("স"),
-        'h' => Some("হ"),
+        'l' | 'L' => Some("ল"),
+        'w' | 'W' => Some("ৱ"),
+        's' | 'S' => Some("স"),
+        'h' | 'H' => Some("হ"),
         'R' => Some("ড়"),
-        'y' => Some("য়"),
-        'x' => Some("ক্ষ"),
+        'y' | 'Y' => Some("য়"),
+        'x' | 'X' => Some("ক্ষ"),
         _ => None,
     };
 
@@ -440,14 +297,12 @@ fn translate_smart_assamese(
     }
 
     let other = match single {
-        'a' => Some(if after_consonant { "া" } else { "অ" }),
-        'i' => Some(if after_consonant { "ি" } else { "ই" }),
-        'u' => Some(if after_consonant { "ু" } else { "উ" }),
-        'e' => Some(if after_consonant { "ে" } else { "এ" }),
+        'a' | 'A' => Some(if after_consonant { "া" } else { "অ" }),
+        'i' | 'I' => Some(if after_consonant { "ি" } else { "ই" }),
+        'u' | 'U' => Some(if after_consonant { "ু" } else { "উ" }),
+        'e' | 'E' => Some(if after_consonant { "ে" } else { "এ" }),
         'o' => Some("ও"),
         'O' => Some(if after_consonant { "ো" } else { "ও" }),
-        'H' => Some("ঃ"),
-        'M' => Some("ং"),
         '^' => Some("ঁ"),
         '/' | '\\' => Some("্"),
         '.' => Some("।"),
@@ -467,58 +322,17 @@ fn translate_smart_assamese(
     other.map(|s| (s.to_string(), 0, false))
 }
 
-fn translate_ai_mode(
-    word_raw: &str,
-    combo: &str,
-    single: char,
-    after_consonant: bool,
-) -> Option<(String, usize, bool)> {
-    match combo {
-        "ksh" | "x" => return Some(("ক্ষ".to_string(), if combo.len() == 3 { 2 } else { 0 }, true)),
-        "jny" | "gya" => return Some(("জ্ঞ".to_string(), 2, true)),
-        "shr" => return Some(("শ্ৰ".to_string(), 2, true)),
-        "tr" if !after_consonant => return Some(("ত্ৰ".to_string(), 1, true)),
-        "ngk" => return Some(("ঙ্ক".to_string(), 2, true)),
-        "ngg" => return Some(("ঙ্গ".to_string(), 2, true)),
-        "hm" => return Some(("হ্ম".to_string(), 1, true)),
-        "ri" if !after_consonant => return Some(("ঋ".to_string(), 1, false)),
-        _ => {}
+fn pop_unicode_chars(s: &mut String, count: usize) {
+    for _ in 0..count {
+        s.pop();
     }
-
-    match single {
-        '&' => return Some(("ক্ষ".to_string(), 0, true)),
-        '*' => return Some(("জ্ঞ".to_string(), 0, true)),
-        '^' if after_consonant => return Some(("ঁ".to_string(), 0, false)),
-        '^' => return Some(("ত্ৰ".to_string(), 0, true)),
-        '!' => return Some(("হ্ম".to_string(), 0, true)),
-        '~' => return Some(("‘".to_string(), 0, false)),
-        '@' => return Some(("’".to_string(), 0, false)),
-        '|' => return Some(("ৎ".to_string(), 0, false)),
-        '[' => return Some(("ড".to_string(), 0, true)),
-        '{' => return Some(("ঢ".to_string(), 0, true)),
-        '}' => return Some(("ঞ".to_string(), 0, true)),
-        ']' => return Some(("়".to_string(), 0, false)),
-        '>' => return Some(("।".to_string(), 0, false)),
-        _ => {}
-    }
-
-    if single == 'd'
-        && after_consonant
-        && (word_raw.ends_with("kd")
-            || word_raw.ends_with("gd")
-            || word_raw.ends_with("td")
-            || word_raw.ends_with("pd")
-            || word_raw.ends_with("md")
-            || word_raw.ends_with("sd"))
-    {
-        return Some(("্".to_string(), 0, false));
-    }
-
-    translate_smart_assamese(combo, single, after_consonant)
 }
 
-unsafe fn read_kbdllhookstruct(lparam: LPARAM) -> KBDLLHOOKSTRUCT {
-    unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) }
+fn reset_word_buffer(ctx: &mut EngineContext) {
+    ctx.buffer.clear();
+    ctx.word_unicode.clear();
+    ctx.word_emitted_len = 0;
+    ctx.prev_was_consonant = false;
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -526,7 +340,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         && !IS_INJECTING.load(Ordering::SeqCst)
         && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN)
     {
-        let kb = unsafe { read_kbdllhookstruct(lparam) };
+        let kb = *(lparam.0 as *const KBDLLHOOKSTRUCT);
         let vk = kb.vkCode;
         let ctrl = is_key_down(VK_CONTROL);
         let alt = is_key_down(VK_MENU);
@@ -537,7 +351,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         {
             let mut ctx = ENGINE.lock().unwrap();
             ctx.state.enabled = !ctx.state.enabled;
-            clear_composition(&mut ctx);
+            reset_word_buffer(&mut ctx);
             if let Some(app) = &ctx.app_handle {
                 let _ = app.emit("ime-state-changed", ctx.state.clone());
             }
@@ -545,128 +359,102 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         }
 
         if ctrl || alt {
-            return unsafe { CallNextHookEx(get_hook_handle(), code, wparam, lparam) };
+            return CallNextHookEx(get_hook_handle(), code, wparam, lparam);
         }
 
+        let current_exe = get_foreground_exe_name();
         let mut ctx = ENGINE.lock().unwrap();
+
+        if !current_exe.eq_ignore_ascii_case("assamese-ime.exe")
+            && ctx.state.active_app != current_exe
+        {
+            ctx.state.active_app = current_exe.clone();
+            reset_word_buffer(&mut ctx);
+            if let Some(saved_font_id) = ctx.per_app_font_memory.get(&current_exe).cloned() {
+                ctx.state.active_font_id = saved_font_id;
+            }
+            if let Some(app) = &ctx.app_handle {
+                let _ = app.emit("ime-state-changed", ctx.state.clone());
+            }
+        }
+
         if ctx.state.enabled {
-            if vk == VK_SPACE.0 as u32
-                || vk == VK_BACK.0 as u32
-                || vk == 0x0D
-                || vk == 0x09
-                || is_navigation_key(vk)
-            {
-                clear_composition(&mut ctx);
-                drop(ctx);
-                return unsafe { CallNextHookEx(get_hook_handle(), code, wparam, lparam) };
+            if vk == VK_SPACE.0 as u32 || vk == VK_BACK.0 as u32 || vk == 0x0D || vk == 0x09 {
+                reset_word_buffer(&mut ctx);
+                return CallNextHookEx(get_hook_handle(), code, wparam, lparam);
             }
 
             if let Some(ch) = vk_to_char(vk, shift) {
-                let is_legacy = ctx.state.encoding == "legacy";
-                ctx.word_raw.push(ch);
+                let active_profile = ctx
+                    .installed_fonts
+                    .iter()
+                    .find(|f| f.id == ctx.state.active_font_id)
+                    .cloned()
+                    .unwrap_or_else(|| ctx.installed_fonts[0].clone());
 
-                match ctx.state.layout.as_str() {
-                    "phonetic" => {
-                        if let Some((uni_out, is_reph)) = translate_chart_phonetic(ch) {
-                            if is_reph && !ctx.last_unicode_char.is_empty() && !is_legacy {
-                                let combined = format!("ৰ্{}", ctx.last_unicode_char);
-                                send_text(&combined, 1);
-                                ctx.last_unicode_char = combined;
-                            } else if is_legacy
-                                && (uni_out == "ি" || uni_out == "ে" || uni_out == "ৈ")
-                                && !ctx.last_unicode_char.is_empty()
-                            {
-                                let matra_ascii = unicode_to_legacy_ascii(uni_out);
-                                let prev_cons_ascii =
-                                    unicode_to_legacy_ascii(&ctx.last_unicode_char);
-                                send_text(&format!("{}{}", matra_ascii, prev_cons_ascii), 1);
-                                ctx.last_unicode_char = uni_out.to_string();
-                            } else {
-                                let final_out = if is_legacy {
-                                    unicode_to_legacy_ascii(uni_out)
-                                } else {
-                                    uni_out.to_string()
-                                };
-                                send_text(&final_out, 0);
-                                ctx.last_unicode_char = uni_out.to_string();
+                // DIRECT PHONETIC PASS-THROUGH FOR GEETANJALI / RAMDHENU:
+                // Since Master Keyboard DX layout maps 1-to-1 directly to Geetanjali ASCII slots,
+                // we pass through the exact typed character instantly without any wrapping or buffering.
+                if ctx.state.layout == "phonetic"
+                    && active_profile.standard == FontStandard::RamdhenuGeetanjali
+                {
+                    send_text(&ch.to_string(), 0);
+                    return LRESULT(1);
+                }
+
+                // STANDARD SMART MODE / UNICODE SHAPING PATH:
+                let mut translated = false;
+
+                if ctx.state.layout == "phonetic" {
+                    if let Some((uni_out, is_reph)) =
+                        font_engine::translate_ramdhenu_phonetic_fallback(ch)
+                    {
+                        if is_reph && !ctx.word_unicode.is_empty() {
+                            if let Some(last_c) = ctx.word_unicode.pop() {
+                                ctx.word_unicode.push_str("ৰ্");
+                                ctx.word_unicode.push(last_c);
                             }
-                            return LRESULT(1);
+                        } else {
+                            ctx.word_unicode.push_str(uni_out);
                         }
+                        translated = true;
                     }
-                    "ai_mode" => {
-                        let combo = format!("{}{}", ctx.buffer, ch);
-                        if let Some((uni_out, backspaces, is_cons)) =
-                            translate_ai_mode(&ctx.word_raw, &combo, ch, ctx.prev_was_consonant)
-                        {
-                            if backspaces > 0 {
-                                ctx.buffer.clear();
-                            } else {
-                                ctx.buffer = ch.to_string();
-                            }
-                            ctx.prev_was_consonant = is_cons;
-
-                            if !uni_out.is_empty() {
-                                if is_legacy
-                                    && (uni_out == "ি" || uni_out == "ে" || uni_out == "ৈ")
-                                    && !ctx.last_unicode_char.is_empty()
-                                {
-                                    let matra_ascii = unicode_to_legacy_ascii(&uni_out);
-                                    let prev_cons_ascii =
-                                        unicode_to_legacy_ascii(&ctx.last_unicode_char);
-                                    send_text(&format!("{}{}", matra_ascii, prev_cons_ascii), 1);
-                                } else {
-                                    let final_out = if is_legacy {
-                                        unicode_to_legacy_ascii(&uni_out)
-                                    } else {
-                                        uni_out.clone()
-                                    };
-                                    send_text(&final_out, backspaces);
-                                }
-                                ctx.last_unicode_char = uni_out;
-                            }
-                            return LRESULT(1);
+                } else {
+                    let combo = format!("{}{}", ctx.buffer, ch);
+                    if let Some((uni_out, backspaces, is_cons)) =
+                        translate_smart_mode(&combo, ch, ctx.prev_was_consonant)
+                    {
+                        if backspaces > 0 {
+                            pop_unicode_chars(&mut ctx.word_unicode, backspaces);
                         }
-                    }
-                    _ => {
-                        let combo = format!("{}{}", ctx.buffer, ch);
-                        if let Some((uni_out, backspaces, is_cons)) =
-                            translate_smart_assamese(&combo, ch, ctx.prev_was_consonant)
-                        {
-                            if backspaces > 0 {
-                                ctx.buffer.clear();
-                            } else {
-                                ctx.buffer = ch.to_string();
-                            }
-                            ctx.prev_was_consonant = is_cons;
+                        let next_buf = format!("{}{}", ctx.buffer, ch);
+                        ctx.buffer = next_buf
+                            .chars()
+                            .rev()
+                            .take(2)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect();
 
-                            if !uni_out.is_empty() {
-                                if is_legacy
-                                    && (uni_out == "ি" || uni_out == "ে" || uni_out == "ৈ")
-                                    && !ctx.last_unicode_char.is_empty()
-                                {
-                                    let matra_ascii = unicode_to_legacy_ascii(&uni_out);
-                                    let prev_cons_ascii =
-                                        unicode_to_legacy_ascii(&ctx.last_unicode_char);
-                                    send_text(&format!("{}{}", matra_ascii, prev_cons_ascii), 1);
-                                } else {
-                                    let final_out = if is_legacy {
-                                        unicode_to_legacy_ascii(&uni_out)
-                                    } else {
-                                        uni_out.clone()
-                                    };
-                                    send_text(&final_out, backspaces);
-                                }
-                                ctx.last_unicode_char = uni_out;
-                            }
-                            return LRESULT(1);
-                        }
+                        ctx.prev_was_consonant = is_cons;
+                        ctx.word_unicode.push_str(&uni_out);
+                        translated = true;
                     }
                 }
-                clear_composition(&mut ctx);
+
+                if translated {
+                    let shaped_word = shape_unicode_for_profile(&ctx.word_unicode, &active_profile);
+                    let prev_len = ctx.word_emitted_len;
+                    ctx.word_emitted_len = shaped_word.chars().count();
+
+                    send_text(&shaped_word, prev_len);
+                    return LRESULT(1);
+                }
             }
         }
     }
-    unsafe { CallNextHookEx(get_hook_handle(), code, wparam, lparam) }
+    CallNextHookEx(get_hook_handle(), code, wparam, lparam)
 }
 
 #[tauri::command]
@@ -675,42 +463,52 @@ fn get_ime_state() -> ImeState {
 }
 
 #[tauri::command]
-fn update_ime_state(app: AppHandle, enabled: bool, layout: String, encoding: String) -> ImeState {
+fn get_detected_fonts() -> Vec<DetectedFontProfile> {
+    ENGINE.lock().unwrap().installed_fonts.clone()
+}
+
+#[tauri::command]
+fn rescan_system_fonts() -> Vec<DetectedFontProfile> {
+    let fonts = scan_installed_assamese_fonts();
+    let mut ctx = ENGINE.lock().unwrap();
+    ctx.installed_fonts = fonts.clone();
+    fonts
+}
+
+#[tauri::command]
+fn update_ime_state(
+    app: AppHandle,
+    enabled: bool,
+    layout: String,
+    active_font_id: String,
+) -> ImeState {
     let mut ctx = ENGINE.lock().unwrap();
     ctx.state.enabled = enabled;
     ctx.state.layout = layout;
-    ctx.state.encoding = encoding;
-    clear_composition(&mut ctx);
+    ctx.state.active_font_id = active_font_id.clone();
+
+    let current_app = ctx.state.active_app.clone();
+    if current_app != "Desktop" && !current_app.eq_ignore_ascii_case("assamese-ime.exe") {
+        ctx.per_app_font_memory.insert(current_app, active_font_id);
+    }
+
+    reset_word_buffer(&mut ctx);
     let _ = app.emit("ime-state-changed", ctx.state.clone());
     ctx.state.clone()
 }
 
 #[tauri::command]
 fn inject_character(unicode_text: String) {
-    let (is_legacy, previous_character) = {
-        let mut ctx = ENGINE.lock().unwrap();
-        let is_legacy = ctx.state.encoding == "legacy";
-        let previous_character = ctx.last_unicode_char.clone();
-        clear_composition(&mut ctx);
-        ctx.last_unicode_char = unicode_text.clone();
-        (is_legacy, previous_character)
+    let profile = {
+        let ctx = ENGINE.lock().unwrap();
+        ctx.installed_fonts
+            .iter()
+            .find(|f| f.id == ctx.state.active_font_id)
+            .cloned()
+            .unwrap_or_else(|| ctx.installed_fonts[0].clone())
     };
-
-    if is_legacy
-        && matches!(unicode_text.as_str(), "ি" | "ে" | "ৈ")
-        && !previous_character.is_empty()
-    {
-        let matra = unicode_to_legacy_ascii(&unicode_text);
-        let previous = unicode_to_legacy_ascii(&previous_character);
-        send_text(&format!("{matra}{previous}"), previous.chars().count());
-    } else {
-        let output = if is_legacy {
-            unicode_to_legacy_ascii(&unicode_text)
-        } else {
-            unicode_text
-        };
-        send_text(&output, 0);
-    }
+    let output = shape_unicode_for_profile(&unicode_text, &profile);
+    send_text(&output, 0);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -742,6 +540,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_ime_state,
+            get_detected_fonts,
+            rescan_system_fonts,
             update_ime_state,
             inject_character
         ])
