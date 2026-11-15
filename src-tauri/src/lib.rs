@@ -48,6 +48,13 @@ static ENGINE: Lazy<Mutex<EngineContext>> = Lazy::new(|| {
 static HOOK_HANDLE_RAW: AtomicIsize = AtomicIsize::new(0);
 static IS_INJECTING: AtomicBool = AtomicBool::new(false);
 
+fn clear_composition(ctx: &mut EngineContext) {
+    ctx.buffer.clear();
+    ctx.word_raw.clear();
+    ctx.prev_was_consonant = false;
+    ctx.last_unicode_char.clear();
+}
+
 fn get_hook_handle() -> HHOOK {
     HHOOK(HOOK_HANDLE_RAW.load(Ordering::SeqCst) as *mut core::ffi::c_void)
 }
@@ -154,6 +161,10 @@ fn vk_to_char(vk: u32, shift: bool) -> Option<char> {
         0xDC => Some(if shift { '|' } else { '\\' }),
         _ => None,
     }
+}
+
+fn is_navigation_key(vk: u32) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E)
 }
 
 fn unicode_to_legacy_ascii(uni: &str) -> String {
@@ -506,12 +517,16 @@ fn translate_ai_mode(
     translate_smart_assamese(combo, single, after_consonant)
 }
 
+unsafe fn read_kbdllhookstruct(lparam: LPARAM) -> KBDLLHOOKSTRUCT {
+    unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) }
+}
+
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0
         && !IS_INJECTING.load(Ordering::SeqCst)
         && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN)
     {
-        let kb = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let kb = unsafe { read_kbdllhookstruct(lparam) };
         let vk = kb.vkCode;
         let ctrl = is_key_down(VK_CONTROL);
         let alt = is_key_down(VK_MENU);
@@ -522,10 +537,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         {
             let mut ctx = ENGINE.lock().unwrap();
             ctx.state.enabled = !ctx.state.enabled;
-            ctx.buffer.clear();
-            ctx.word_raw.clear();
-            ctx.prev_was_consonant = false;
-            ctx.last_unicode_char.clear();
+            clear_composition(&mut ctx);
             if let Some(app) = &ctx.app_handle {
                 let _ = app.emit("ime-state-changed", ctx.state.clone());
             }
@@ -538,11 +550,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
         let mut ctx = ENGINE.lock().unwrap();
         if ctx.state.enabled {
-            if vk == VK_SPACE.0 as u32 || vk == VK_BACK.0 as u32 || vk == 0x0D || vk == 0x09 {
-                ctx.buffer.clear();
-                ctx.word_raw.clear();
-                ctx.prev_was_consonant = false;
-                ctx.last_unicode_char.clear();
+            if vk == VK_SPACE.0 as u32
+                || vk == VK_BACK.0 as u32
+                || vk == 0x0D
+                || vk == 0x09
+                || is_navigation_key(vk)
+            {
+                clear_composition(&mut ctx);
                 drop(ctx);
                 return unsafe { CallNextHookEx(get_hook_handle(), code, wparam, lparam) };
             }
@@ -648,6 +662,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         }
                     }
                 }
+                clear_composition(&mut ctx);
             }
         }
     }
@@ -665,12 +680,37 @@ fn update_ime_state(app: AppHandle, enabled: bool, layout: String, encoding: Str
     ctx.state.enabled = enabled;
     ctx.state.layout = layout;
     ctx.state.encoding = encoding;
-    ctx.buffer.clear();
-    ctx.word_raw.clear();
-    ctx.prev_was_consonant = false;
-    ctx.last_unicode_char.clear();
+    clear_composition(&mut ctx);
     let _ = app.emit("ime-state-changed", ctx.state.clone());
     ctx.state.clone()
+}
+
+#[tauri::command]
+fn inject_character(unicode_text: String) {
+    let (is_legacy, previous_character) = {
+        let mut ctx = ENGINE.lock().unwrap();
+        let is_legacy = ctx.state.encoding == "legacy";
+        let previous_character = ctx.last_unicode_char.clone();
+        clear_composition(&mut ctx);
+        ctx.last_unicode_char = unicode_text.clone();
+        (is_legacy, previous_character)
+    };
+
+    if is_legacy
+        && matches!(unicode_text.as_str(), "ি" | "ে" | "ৈ")
+        && !previous_character.is_empty()
+    {
+        let matra = unicode_to_legacy_ascii(&unicode_text);
+        let previous = unicode_to_legacy_ascii(&previous_character);
+        send_text(&format!("{matra}{previous}"), previous.chars().count());
+    } else {
+        let output = if is_legacy {
+            unicode_to_legacy_ascii(&unicode_text)
+        } else {
+            unicode_text
+        };
+        send_text(&output, 0);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -700,7 +740,11 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ime_state, update_ime_state])
+        .invoke_handler(tauri::generate_handler![
+            get_ime_state,
+            update_ime_state,
+            inject_character
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
