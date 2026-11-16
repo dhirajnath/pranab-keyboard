@@ -1,25 +1,21 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
+# Dependencies & Build Outputs
+node_modules/
+dist/
+dist-ssr/
 *.local
-src-tauri/target/
 
-# Editor directories and files
+# Rust & Tauri Build Artifacts
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Proprietary / Third-Party Font Binaries
+*.ttf
+*.otf
+*.woff
+*.woff2
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
 .vscode/*
 !.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?

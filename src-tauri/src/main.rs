@@ -1,6 +1,5 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    assamese_ime_lib::run()
+    pranab_keyboard_lib::run()
 }

@@ -1,8 +1,6 @@
-mod font_engine;
+mod font_converter;
 
-use font_engine::{
-    scan_installed_assamese_fonts, shape_unicode_for_profile, DetectedFontProfile, FontStandard,
-};
+use font_converter::{auto_convert_and_register_fonts, ConvertedFontInfo};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -28,14 +26,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Clone, Serialize)]
 pub struct ImeState {
     pub enabled: bool,
-    pub layout: String,         // "phonetic" | "smart"
-    pub active_font_id: String, // e.g., "builtin_ramdhenu" or "auto_unicode"
+    pub layout: String, // "phonetic" | "smart"
+    pub active_font_id: String,
     pub active_app: String,
 }
 
 struct EngineContext {
     state: ImeState,
-    installed_fonts: Vec<DetectedFontProfile>,
+    converted_fonts: Vec<ConvertedFontInfo>,
     per_app_font_memory: HashMap<String, String>,
     buffer: String,
     word_unicode: String,
@@ -45,15 +43,15 @@ struct EngineContext {
 }
 
 static ENGINE: Lazy<Mutex<EngineContext>> = Lazy::new(|| {
-    let fonts = scan_installed_assamese_fonts();
+    let fonts = auto_convert_and_register_fonts();
     Mutex::new(EngineContext {
         state: ImeState {
             enabled: false,
             layout: "phonetic".into(),
-            active_font_id: "builtin_ramdhenu".into(),
+            active_font_id: "auto_unicode".into(),
             active_app: "Desktop".into(),
         },
-        installed_fonts: fonts,
+        converted_fonts: fonts,
         per_app_font_memory: HashMap::new(),
         buffer: String::new(),
         word_unicode: String::new(),
@@ -72,6 +70,11 @@ fn get_hook_handle() -> HHOOK {
 
 fn is_key_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+fn is_self_process(exe_name: &str) -> bool {
+    exe_name.eq_ignore_ascii_case("pranab-keyboard.exe")
+        || exe_name.eq_ignore_ascii_case("Pranab Keyboard.exe")
 }
 
 fn get_foreground_exe_name() -> String {
@@ -207,7 +210,114 @@ fn vk_to_char(vk: u32, shift: bool) -> Option<char> {
     }
 }
 
-/// Smart Mode: Natural Romanized Transliteration
+fn translate_phonetic_unicode(ch: char) -> Option<(&'static str, bool)> {
+    match ch {
+        '`' => Some(("ং", false)),
+        '1' => Some(("১", false)),
+        '2' => Some(("২", false)),
+        '3' => Some(("৩", false)),
+        '4' => Some(("৪", false)),
+        '5' => Some(("৫", false)),
+        '6' => Some(("৬", false)),
+        '7' => Some(("৭", false)),
+        '8' => Some(("৮", false)),
+        '9' => Some(("৯", false)),
+        '0' => Some(("০", false)),
+        '-' => Some(("-", false)),
+        '=' => Some(("ৃ", false)),
+
+        'q' => Some(("ৌ", false)),
+        'w' => Some(("ৈ", false)),
+        'e' => Some(("া", false)),
+        'r' => Some(("ী", false)),
+        't' => Some(("ূ", false)),
+        'y' => Some(("ব", false)),
+        'u' => Some(("হ", false)),
+        'i' => Some(("গ", false)),
+        'o' => Some(("দ", false)),
+        'p' => Some(("জ", false)),
+        '[' => Some(("ড", false)),
+        ']' => Some(("়", false)),
+        '\\' => Some(("য", false)),
+
+        'a' => Some(("ো", false)),
+        's' => Some(("ে", false)),
+        'd' => Some(("্", false)),
+        'f' => Some(("ি", false)),
+        'g' => Some(("ু", false)),
+        'h' => Some(("প", false)),
+        'j' => Some(("ৰ", false)),
+        'k' => Some(("ক", false)),
+        'l' => Some(("ত", false)),
+        ';' => Some(("চ", false)),
+        '\'' => Some(("ট", false)),
+
+        'z' => Some(("্ৰ", false)),
+        'x' => Some(("ং", false)),
+        'c' => Some(("ম", false)),
+        'v' => Some(("ন", false)),
+        'b' => Some(("ৱ", false)),
+        'n' => Some(("ল", false)),
+        'm' => Some(("স", false)),
+        ',' => Some((",", false)),
+        '.' => Some((".", false)),
+        '/' => Some(("য়", false)),
+
+        '~' => Some(("‘", false)),
+        '!' => Some(("হ্ম", false)),
+        '@' => Some(("’", false)),
+        '#' => Some((":", false)),
+        '$' => Some(("/", false)),
+        '%' => Some((";", false)),
+        '^' => Some(("ত্ৰ", false)),
+        '&' => Some(("ক্ষ", false)),
+        '*' => Some(("জ্ঞ", false)),
+        '(' => Some(("(", false)),
+        ')' => Some((")", false)),
+        '_' => Some(("ঃ", false)),
+        '+' => Some(("ঋ", false)),
+
+        'Q' => Some(("ঔ", false)),
+        'W' => Some(("ঐ", false)),
+        'E' => Some(("আ", false)),
+        'R' => Some(("ঈ", false)),
+        'T' => Some(("ঊ", false)),
+        'Y' => Some(("ভ", false)),
+        'U' => Some(("ঙ", false)),
+        'I' => Some(("ঘ", false)),
+        'O' => Some(("ধ", false)),
+        'P' => Some(("ঝ", false)),
+        '{' => Some(("ঢ", false)),
+        '}' => Some(("ঞ", false)),
+        '|' => Some(("ৎ", false)),
+
+        'A' => Some(("ও", false)),
+        'S' => Some(("এ", false)),
+        'D' => Some(("অ", false)),
+        'F' => Some(("ই", false)),
+        'G' => Some(("উ", false)),
+        'H' => Some(("ফ", false)),
+        'J' => Some(("ৰ", false)),
+        'K' => Some(("খ", false)),
+        'L' => Some(("থ", false)),
+        ':' => Some(("ছ", false)),
+        '"' => Some(("ঠ", false)),
+
+        'Z' => Some(("ৰ্", true)),
+        'X' => Some(("ঁ", false)),
+        'C' => Some(("ণ", false)),
+        'V' => Some(("V", false)),
+        'B' => Some(("B", false)),
+        'N' => Some(("ঙ্গ", false)),
+        'M' => Some(("শ", false)),
+        '<' => Some(("ষ", false)),
+        '>' => Some(("।", false)),
+        '?' => Some(("?", false)),
+
+        _ => None,
+    }
+}
+
 fn translate_smart_mode(
     combo: &str,
     single: char,
@@ -365,9 +475,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let current_exe = get_foreground_exe_name();
         let mut ctx = ENGINE.lock().unwrap();
 
-        if !current_exe.eq_ignore_ascii_case("assamese-ime.exe")
-            && ctx.state.active_app != current_exe
-        {
+        if !is_self_process(&current_exe) && ctx.state.active_app != current_exe {
             ctx.state.active_app = current_exe.clone();
             reset_word_buffer(&mut ctx);
             if let Some(saved_font_id) = ctx.per_app_font_memory.get(&current_exe).cloned() {
@@ -385,39 +493,23 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             }
 
             if let Some(ch) = vk_to_char(vk, shift) {
-                let active_profile = ctx
-                    .installed_fonts
-                    .iter()
-                    .find(|f| f.id == ctx.state.active_font_id)
-                    .cloned()
-                    .unwrap_or_else(|| ctx.installed_fonts[0].clone());
-
-                // DIRECT PHONETIC PASS-THROUGH FOR GEETANJALI / RAMDHENU:
-                // Since Master Keyboard DX layout maps 1-to-1 directly to Geetanjali ASCII slots,
-                // we pass through the exact typed character instantly without any wrapping or buffering.
-                if ctx.state.layout == "phonetic"
-                    && active_profile.standard == FontStandard::RamdhenuGeetanjali
-                {
-                    send_text(&ch.to_string(), 0);
-                    return LRESULT(1);
-                }
-
-                // STANDARD SMART MODE / UNICODE SHAPING PATH:
-                let mut translated = false;
-
                 if ctx.state.layout == "phonetic" {
-                    if let Some((uni_out, is_reph)) =
-                        font_engine::translate_ramdhenu_phonetic_fallback(ch)
-                    {
+                    if let Some((uni_out, is_reph)) = translate_phonetic_unicode(ch) {
                         if is_reph && !ctx.word_unicode.is_empty() {
                             if let Some(last_c) = ctx.word_unicode.pop() {
                                 ctx.word_unicode.push_str("ৰ্");
                                 ctx.word_unicode.push(last_c);
+                                let prev_len = ctx.word_emitted_len;
+                                ctx.word_emitted_len = ctx.word_unicode.chars().count();
+                                let out = ctx.word_unicode.clone();
+                                send_text(&out, prev_len);
+                                return LRESULT(1);
                             }
-                        } else {
-                            ctx.word_unicode.push_str(uni_out);
                         }
-                        translated = true;
+                        ctx.word_unicode.push_str(uni_out);
+                        ctx.word_emitted_len = ctx.word_unicode.chars().count();
+                        send_text(uni_out, 0);
+                        return LRESULT(1);
                     }
                 } else {
                     let combo = format!("{}{}", ctx.buffer, ch);
@@ -439,17 +531,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
                         ctx.prev_was_consonant = is_cons;
                         ctx.word_unicode.push_str(&uni_out);
-                        translated = true;
+
+                        let prev_len = ctx.word_emitted_len;
+                        ctx.word_emitted_len = ctx.word_unicode.chars().count();
+                        let out = ctx.word_unicode.clone();
+                        send_text(&out, prev_len);
+                        return LRESULT(1);
                     }
-                }
-
-                if translated {
-                    let shaped_word = shape_unicode_for_profile(&ctx.word_unicode, &active_profile);
-                    let prev_len = ctx.word_emitted_len;
-                    ctx.word_emitted_len = shaped_word.chars().count();
-
-                    send_text(&shaped_word, prev_len);
-                    return LRESULT(1);
                 }
             }
         }
@@ -463,15 +551,15 @@ fn get_ime_state() -> ImeState {
 }
 
 #[tauri::command]
-fn get_detected_fonts() -> Vec<DetectedFontProfile> {
-    ENGINE.lock().unwrap().installed_fonts.clone()
+fn get_detected_fonts() -> Vec<ConvertedFontInfo> {
+    ENGINE.lock().unwrap().converted_fonts.clone()
 }
 
 #[tauri::command]
-fn rescan_system_fonts() -> Vec<DetectedFontProfile> {
-    let fonts = scan_installed_assamese_fonts();
+fn rescan_system_fonts() -> Vec<ConvertedFontInfo> {
+    let fonts = auto_convert_and_register_fonts();
     let mut ctx = ENGINE.lock().unwrap();
-    ctx.installed_fonts = fonts.clone();
+    ctx.converted_fonts = fonts.clone();
     fonts
 }
 
@@ -488,7 +576,7 @@ fn update_ime_state(
     ctx.state.active_font_id = active_font_id.clone();
 
     let current_app = ctx.state.active_app.clone();
-    if current_app != "Desktop" && !current_app.eq_ignore_ascii_case("assamese-ime.exe") {
+    if current_app != "Desktop" && !is_self_process(&current_app) {
         ctx.per_app_font_memory.insert(current_app, active_font_id);
     }
 
@@ -499,16 +587,7 @@ fn update_ime_state(
 
 #[tauri::command]
 fn inject_character(unicode_text: String) {
-    let profile = {
-        let ctx = ENGINE.lock().unwrap();
-        ctx.installed_fonts
-            .iter()
-            .find(|f| f.id == ctx.state.active_font_id)
-            .cloned()
-            .unwrap_or_else(|| ctx.installed_fonts[0].clone())
-    };
-    let output = shape_unicode_for_profile(&unicode_text, &profile);
-    send_text(&output, 0);
+    send_text(&unicode_text, 0);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

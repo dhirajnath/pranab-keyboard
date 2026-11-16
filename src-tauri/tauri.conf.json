@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "assamese-ime",
+  "productName": "Pranab Keyboard",
   "version": "0.1.0",
-  "identifier": "com.dhiraj.assamese-ime",
+  "identifier": "com.pranabkeyboard.ime",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,17 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "AsomIME",
-        "width": 560,
-        "height": 48,
+        "title": "Pranab Keyboard",
+        "width": 550,
+        "height": 54,
+        "resizable": false,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "alwaysOnTop": true,
-        "resizable": false,
-        "skipTaskbar": false,
-        "center": false,
-        "x": 450,
-        "y": 16
+        "skipTaskbar": false
       }
     ],
     "security": {
@@ -38,6 +36,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "resources": [
+      "../LICENSE",
+      "../THIRD_PARTY_NOTICES.txt"
     ]
   }
 }

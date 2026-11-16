@@ -1,8 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import "./App.css";
+import {
+  Keyboard,
+  RefreshCw,
+  LayoutGrid,
+  GripHorizontal,
+  X,
+  Sparkles,
+  Type,
+} from "lucide-react";
 
 interface ImeState {
   enabled: boolean;
@@ -11,119 +19,97 @@ interface ImeState {
   active_app: string;
 }
 
-interface DetectedFontProfile {
+interface ConvertedFontInfo {
   id: string;
-  family_name: string;
-  badge: string;
+  original_name: string;
+  unicode_family_name: string;
+  script_label: string;
+  output_path: string;
+  newly_converted: boolean;
 }
 
-interface KeyDef {
-  en: string;
-  normal: string;
-  shift: string;
+const CONJUNCTS = [
+  { label: "ক্ষ", seq: "ক্ষ", hint: "k+d+< / ksh" },
+  { label: "জ্ঞ", seq: "জ্ঞ", hint: "p+d+} / jny" },
+  { label: "ত্ৰ", seq: "ত্ৰ", hint: "l+d+j / tr" },
+  { label: "শ্ৰ", seq: "শ্ৰ", hint: "M+d+j / shr" },
+  { label: "ঙ্গ", seq: "ঙ্গ", hint: "U+d+i / ngg" },
+  { label: "ঙ্ক", seq: "ঙ্ক", hint: "U+d+k / ngk" },
+  { label: "হ্ম", seq: "হ্ম", hint: "u+d+c / hm" },
+  { label: "ন্দ", seq: "ন্দ", hint: "v+d+o / nd" },
+  { label: "স্ত", seq: "স্ত", hint: "m+d+l / st" },
+  { label: "প্ৰ", seq: "প্ৰ", hint: "h+d+j / pr" },
+];
+
+const PHONETIC_HINTS = [
+  { key: "k / K", out: "ক / খ" },
+  { key: "i / I", out: "গ / ঘ" },
+  { key: "; / :", out: "চ / ছ" },
+  { key: "p / P", out: "জ / ঝ" },
+  { key: "' / \"", out: "ট / ঠ" },
+  { key: "[ / {", out: "ড / ঢ" },
+  { key: "l / L", out: "ত / থ" },
+  { key: "o / O", out: "দ / ধ" },
+  { key: "v / C", out: "ন / ণ" },
+  { key: "h / H", out: "প / ফ" },
+  { key: "y / Y", out: "ব / ভ" },
+  { key: "c / j", out: "ম / ৰ" },
+  { key: "n / b", out: "ল / ৱ" },
+  { key: "M / < / m", out: "শ / ষ / স" },
+  { key: "u / & / *", out: "হ / ক্ষ / জ্ঞ" },
+  { key: "e / f / r", out: "া / ি / ী" },
+  { key: "g / t / =", out: "ু / ূ / ৃ" },
+  { key: "s / w / a / q", out: "ে / ৈ / ো / ৌ" },
+];
+
+const WINDOW_WIDTH = 550;
+
+function PranabAppIcon() {
+  return (
+    <div
+      data-tauri-drag-region
+      title="Pranab Keyboard"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: "24px",
+        height: "24px",
+        borderRadius: "7px",
+        background: "linear-gradient(135deg, #f59e0b 0%, #d97706 100%)",
+        boxShadow: "0 2px 6px rgba(245, 158, 11, 0.35)",
+        color: "#09090b",
+        fontWeight: 800,
+        fontSize: "14px",
+        lineHeight: 1,
+        flexShrink: 0,
+      }}
+    >
+      <span style={{ pointerEvents: "none", marginTop: "-1px" }}>অ</span>
+    </div>
+  );
 }
-
-const KEY_ROWS: KeyDef[][] = [
-  [
-    { en: "`", normal: "ং", shift: "‘" },
-    { en: "1", normal: "১", shift: "হ্ম" },
-    { en: "2", normal: "২", shift: "’" },
-    { en: "3", normal: "৩", shift: ":" },
-    { en: "4", normal: "৪", shift: "/" },
-    { en: "5", normal: "৫", shift: ";" },
-    { en: "6", normal: "৬", shift: "ত্ৰ" },
-    { en: "7", normal: "৭", shift: "ক্ষ" },
-    { en: "8", normal: "৮", shift: "জ্ঞ" },
-    { en: "9", normal: "৯", shift: "(" },
-    { en: "0", normal: "০", shift: ")" },
-    { en: "-", normal: "-", shift: "ঃ" },
-    { en: "=", normal: "ৃ", shift: "ঋ" },
-  ],
-  [
-    { en: "Q", normal: "ৌ", shift: "ঔ" },
-    { en: "W", normal: "ৈ", shift: "ঐ" },
-    { en: "E", normal: "া", shift: "আ" },
-    { en: "R", normal: "ী", shift: "ঈ" },
-    { en: "T", normal: "ূ", shift: "ঊ" },
-    { en: "Y", normal: "ব", shift: "ভ" },
-    { en: "U", normal: "হ", shift: "ঙ" },
-    { en: "I", normal: "গ", shift: "ঘ" },
-    { en: "O", normal: "দ", shift: "ধ" },
-    { en: "P", normal: "জ", shift: "ঝ" },
-    { en: "[", normal: "ড", shift: "ঢ" },
-    { en: "]", normal: "়", shift: "ঞ" },
-    { en: "\\", normal: "য", shift: "ৎ" },
-  ],
-  [
-    { en: "A", normal: "ো", shift: "ও" },
-    { en: "S", normal: "ে", shift: "এ" },
-    { en: "D", normal: "্", shift: "অ" },
-    { en: "F", normal: "ি", shift: "ই" },
-    { en: "G", normal: "ু", shift: "উ" },
-    { en: "H", normal: "প", shift: "ফ" },
-    { en: "J", normal: "ৰ", shift: "ৰ" },
-    { en: "K", normal: "ক", shift: "খ" },
-    { en: "L", normal: "ত", shift: "থ" },
-    { en: ";", normal: "চ", shift: "ছ" },
-    { en: "'", normal: "ট", shift: "ঠ" },
-  ],
-  [
-    { en: "Z", normal: "্ৰ", shift: "ৰ্" },
-    { en: "X", normal: "ং", shift: "ঁ" },
-    { en: "C", normal: "ম", shift: "ণ" },
-    { en: "V", normal: "ন", shift: "V" },
-    { en: "B", normal: "ৱ", shift: "B" },
-    { en: "N", normal: "ল", shift: "ঙ্গ" },
-    { en: "M", normal: "স", shift: "শ" },
-    { en: ",", normal: ",", shift: "ষ" },
-    { en: ".", normal: ".", shift: "।" },
-    { en: "/", normal: "য়", shift: "?" },
-  ],
-];
-
-const JUKTAKSHARS = [
-  "ক্ষ",
-  "জ্ঞ",
-  "ত্ৰ",
-  "শ্ৰ",
-  "ঙ্গ",
-  "ঙ্ক",
-  "হ্ম",
-  "ন্দ",
-  "ন্ত",
-  "স্প",
-  "স্ত",
-  "প্ৰ",
-  "ক্ৰ",
-  "ব্ধ",
-  "দ্ব",
-  "দ্ধ",
-  "শ্ব",
-  "ল্ল",
-];
-
-const LAYOUT_OPTIONS = [
-  { id: "phonetic", label: "Phonetic", hint: "DTP / Ramdhenu Phonetic (k → ক, Shift+K → খ)" },
-  { id: "smart", label: "Smart", hint: "Romanized Smart Typing (K → ক, Kh → খ)" },
-];
 
 export default function App() {
-  const [state, setState] = useState<ImeState>({
+  const [imeState, setImeState] = useState<ImeState>({
     enabled: false,
     layout: "phonetic",
-    active_font_id: "builtin_ramdhenu",
+    active_font_id: "auto_unicode",
     active_app: "Desktop",
   });
-  const [fonts, setFonts] = useState<DetectedFontProfile[]>([]);
-  const [showChart, setShowChart] = useState(false);
+  const [fonts, setFonts] = useState<ConvertedFontInfo[]>([]);
   const [scanning, setScanning] = useState(false);
+  const [showKeymap, setShowKeymap] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    invoke<ImeState>("get_ime_state").then(setState);
-    invoke<DetectedFontProfile[]>("get_detected_fonts").then(setFonts);
+    invoke<ImeState>("get_ime_state").then(setImeState).catch(console.error);
+    invoke<ConvertedFontInfo[]>("get_detected_fonts")
+      .then(setFonts)
+      .catch(console.error);
 
     const unlisten = listen<ImeState>("ime-state-changed", (event) => {
-      setState(event.payload);
+      setImeState(event.payload);
     });
 
     return () => {
@@ -131,258 +117,443 @@ export default function App() {
     };
   }, []);
 
-  const syncState = async (next: Partial<ImeState>) => {
-    const updated = { ...state, ...next };
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
 
-    // Auto-pair default font family when switching between Phonetic (DTP) and Smart (Unicode)
-    if (next.layout && !next.active_font_id) {
-      if (next.layout === "phonetic" && state.active_font_id === "auto_unicode") {
-        updated.active_font_id = "builtin_ramdhenu";
-      } else if (next.layout === "smart" && state.active_font_id === "builtin_ramdhenu") {
-        updated.active_font_id = "auto_unicode";
+    const syncWindowSize = () => {
+      const measuredHeight = Math.ceil(el.getBoundingClientRect().height);
+      if (measuredHeight > 0) {
+        getCurrentWindow()
+          .setSize(new LogicalSize(WINDOW_WIDTH, measuredHeight))
+          .catch(console.error);
       }
-    }
+    };
 
-    setState(updated);
-    await invoke("update_ime_state", {
-      enabled: updated.enabled,
-      layout: updated.layout,
-      activeFontId: updated.active_font_id,
+    syncWindowSize();
+
+    const observer = new ResizeObserver(() => {
+      syncWindowSize();
     });
-  };
+    observer.observe(el);
 
-  const handleRescanFonts = async () => {
-    setScanning(true);
-    const updatedFonts = await invoke<DetectedFontProfile[]>("rescan_system_fonts");
-    setFonts(updatedFonts);
-    setTimeout(() => setScanning(false), 300);
-  };
+    return () => observer.disconnect();
+  }, [showKeymap]);
 
-  const toggleChart = async () => {
-    const nextOpen = !showChart;
-    setShowChart(nextOpen);
-    const win = getCurrentWindow();
-    if (nextOpen) {
-      await win.setSize(new LogicalSize(600, 355));
-    } else {
-      await win.setSize(new LogicalSize(560, 48));
+  const syncState = async (
+    enabled: boolean,
+    layout: string,
+    active_font_id: string
+  ) => {
+    try {
+      const updated = await invoke<ImeState>("update_ime_state", {
+        enabled,
+        layout,
+        activeFontId: active_font_id,
+      });
+      setImeState(updated);
+    } catch (err) {
+      console.error(err);
     }
   };
 
-  const handleVirtualClick = async (charStr: string) => {
-    await invoke("inject_character", { unicodeText: charStr });
+  const handleToggleEnabled = () => {
+    syncState(!imeState.enabled, imeState.layout, imeState.active_font_id);
   };
 
-  const activeFontObj = fonts.find((f) => f.id === state.active_font_id);
+  const handleLayoutChange = (newLayout: string) => {
+    syncState(imeState.enabled, newLayout, imeState.active_font_id);
+  };
+
+  const handleFontChange = (newFontId: string) => {
+    syncState(imeState.enabled, imeState.layout, newFontId);
+  };
+
+  const handleRescan = async () => {
+    setScanning(true);
+    try {
+      const updatedFonts = await invoke<ConvertedFontInfo[]>(
+        "rescan_system_fonts"
+      );
+      setFonts(updatedFonts);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const handleInject = async (text: string) => {
+    try {
+      await invoke("inject_character", { unicodeText: text });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleMinimize = async () => {
+    await getCurrentWindow().minimize();
+  };
 
   return (
-    <div className="h-screen w-screen flex flex-col select-none bg-transparent p-0.5">
-      {/* Main Frosted Glass Floating Pill Bar */}
+    <div
+      ref={contentRef}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        width: "100%",
+        height: "fit-content",
+        padding: "6px",
+        boxSizing: "border-box",
+        background: "transparent",
+        color: "#f4f4f5",
+      }}
+    >
+      {/* Floating Frosted Obsidian Toolbar */}
       <div
         data-tauri-drag-region
-        className="h-11 w-full flex items-center justify-between px-2.5 glass-shell text-zinc-100 border border-white/10 rounded-full cursor-move shrink-0"
+        style={{
+          display: "flex",
+          flexDirection: "row",
+          alignItems: "center",
+          gap: "8px",
+          padding: "6px 12px",
+          borderRadius: "9999px",
+          backgroundColor: "rgba(9, 9, 11, 0.94)",
+          border: "1px solid rgba(63, 63, 70, 0.85)",
+          boxShadow: "0 8px 24px rgba(0, 0, 0, 0.65)",
+          backdropFilter: "blur(16px)",
+          whiteSpace: "nowrap",
+        }}
       >
-        {/* Drag Grip + App Emblem */}
-        <div data-tauri-drag-region className="flex items-center gap-1.5 pl-1">
-          <span
-            data-tauri-drag-region
-            className="text-zinc-500 text-xs tracking-tighter leading-none"
-            title="Drag toolbar"
-          >
-            ⋮⋮
-          </span>
-          <div
-            data-tauri-drag-region
-            className="w-6 h-6 rounded-lg bg-linear-to-br from-orange-500 to-amber-600 text-white font-bold flex items-center justify-center text-sm shadow-inner border border-orange-300/30"
-          >
-            অ
-          </div>
+        {/* Drag Handle */}
+        <div
+          data-tauri-drag-region
+          title="Drag Pranab Keyboard"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            cursor: "grab",
+            color: "#71717a",
+          }}
+        >
+          <GripHorizontal className="w-4 h-4 pointer-events-none" />
         </div>
 
-        {/* Active Language Toggle Pill (Synced with Ctrl + Space) */}
+        {/* App Icon */}
+        <PranabAppIcon />
+
+        {/* Active Language Toggle Pill */}
         <button
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => syncState({ enabled: !state.enabled })}
-          title="Toggle Assamese / English (Ctrl + Space)"
-          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold transition-all duration-150 cursor-pointer ${
-            state.enabled
-              ? "bg-emerald-500 text-zinc-950 emerald-glow"
-              : "bg-zinc-800/90 text-zinc-300 hover:bg-zinc-700/80 border border-white/5"
-          }`}
+          onClick={handleToggleEnabled}
+          title="Toggle Language (Ctrl + Space)"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "4px 12px",
+            borderRadius: "9999px",
+            border: "none",
+            cursor: "pointer",
+            fontSize: "12px",
+            fontWeight: 700,
+            backgroundColor: imeState.enabled ? "#f59e0b" : "#27272a",
+            color: imeState.enabled ? "#09090b" : "#e4e4e7",
+            boxShadow: imeState.enabled
+              ? "0 0 14px rgba(245, 158, 11, 0.4)"
+              : "none",
+            transition: "all 0.15s ease",
+          }}
         >
-          <span
-            className={`w-1.5 h-1.5 rounded-full ${
-              state.enabled ? "bg-zinc-950 animate-pulse" : "bg-zinc-500"
-            }`}
-          />
-          {state.enabled ? "অসমীয়া" : "ENG"}
+          <Keyboard className="w-3.5 h-3.5" />
+          <span>{imeState.enabled ? "অসমীয়া" : "ENG"}</span>
         </button>
 
-        {/* Segmented Typing Mode Switcher (Phonetic vs Smart) */}
+        {/* Segmented Mode Switcher */}
         <div
-          onMouseDown={(e) => e.preventDefault()}
-          className="flex items-center bg-zinc-900/90 p-0.5 rounded-full border border-white/10"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            backgroundColor: "#18181b",
+            border: "1px solid #27272a",
+            borderRadius: "9999px",
+            padding: "2px",
+          }}
         >
-          {LAYOUT_OPTIONS.map((opt) => {
-            const active = state.layout === opt.id;
-            return (
-              <button
-                key={opt.id}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => syncState({ layout: opt.id })}
-                title={opt.hint}
-                className={`px-2.5 py-0.5 rounded-full text-xs font-medium transition-all duration-150 cursor-pointer ${
-                  active
-                    ? "bg-linear-to-r from-orange-500 to-amber-500 text-zinc-950 font-bold amber-glow"
-                    : "text-zinc-400 hover:text-zinc-200"
-                }`}
-              >
-                {opt.label}
-              </button>
-            );
-          })}
+          <button
+            onClick={() => handleLayoutChange("phonetic")}
+            title="Master Keyboard DX Phonetic Layout"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "4px",
+              padding: "3px 10px",
+              borderRadius: "9999px",
+              border: "none",
+              cursor: "pointer",
+              fontSize: "11px",
+              fontWeight: 600,
+              backgroundColor:
+                imeState.layout === "phonetic" ? "#3f3f46" : "transparent",
+              color: imeState.layout === "phonetic" ? "#fcd34d" : "#a1a1aa",
+            }}
+          >
+            <Type className="w-3 h-3" />
+            <span>Phonetic</span>
+          </button>
+          <button
+            onClick={() => handleLayoutChange("smart")}
+            title="Smart Romanized Transliteration"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "4px",
+              padding: "3px 10px",
+              borderRadius: "9999px",
+              border: "none",
+              cursor: "pointer",
+              fontSize: "11px",
+              fontWeight: 600,
+              backgroundColor:
+                imeState.layout === "smart" ? "#3f3f46" : "transparent",
+              color: imeState.layout === "smart" ? "#fcd34d" : "#a1a1aa",
+            }}
+          >
+            <Sparkles className="w-3 h-3" />
+            <span>Smart</span>
+          </button>
         </div>
 
-        {/* Installed Font Selector + Rescan */}
-        <div className="flex items-center gap-1 bg-zinc-900/90 pl-2 pr-1 py-0.5 rounded-full border border-white/10">
+        {/* Auto-Converted Unicode Font Selector */}
+        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
           <select
-            value={state.active_font_id}
-            onChange={(e) => syncState({ active_font_id: e.target.value })}
-            title="Select installed Assamese font style"
-            className="bg-transparent text-zinc-200 text-xs font-medium max-w-40 truncate outline-none cursor-pointer"
+            value={imeState.active_font_id}
+            onChange={(e) => handleFontChange(e.target.value)}
+            title={`Active App: ${imeState.active_app}`}
+            style={{
+              backgroundColor: "#18181b",
+              border: "1px solid #27272a",
+              color: "#e4e4e7",
+              fontSize: "11px",
+              borderRadius: "9999px",
+              padding: "4px 10px",
+              maxWidth: "175px",
+              outline: "none",
+              cursor: "pointer",
+            }}
           >
             {fonts.map((f) => (
-              <option key={f.id} value={f.id} className="bg-zinc-900 text-zinc-100">
-                [{f.badge}] {f.family_name}
+              <option
+                key={f.id}
+                value={f.id}
+                style={{ backgroundColor: "#18181b", color: "#f4f4f5" }}
+              >
+                [{f.script_label}] {f.unicode_family_name}
               </option>
             ))}
           </select>
 
           <button
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={handleRescanFonts}
-            title="Scan Windows Fonts folder for newly installed fonts"
-            className={`w-5 h-5 rounded-full flex items-center justify-center text-xs text-amber-400 hover:bg-white/10 transition cursor-pointer ${
-              scanning ? "animate-spin" : ""
-            }`}
+            onClick={handleRescan}
+            disabled={scanning}
+            title="Scan & Auto-Convert Legacy Fonts to Unicode"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              width: "26px",
+              height: "26px",
+              borderRadius: "9999px",
+              backgroundColor: "#18181b",
+              border: "1px solid #27272a",
+              color: scanning ? "#fbbf24" : "#a1a1aa",
+              cursor: "pointer",
+            }}
           >
-            ↻
+            <RefreshCw
+              className={`w-3.5 h-3.5 ${scanning ? "animate-spin" : ""}`}
+            />
           </button>
         </div>
 
-        {/* Keymap Drawer & Close Controls */}
-        <div className="flex items-center gap-1 pr-0.5">
-          <button
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={toggleChart}
-            title="Keymap & Juktakshar Cheat-Sheet"
-            className={`w-6 h-6 rounded-full text-xs font-bold flex items-center justify-center transition-all cursor-pointer ${
-              showChart
-                ? "bg-linear-to-br from-orange-500 to-amber-500 text-zinc-950 amber-glow"
-                : "bg-zinc-800/90 text-zinc-300 hover:bg-zinc-700 border border-white/5"
-            }`}
-          >
-            ?
-          </button>
+        {/* Keymap & Juktakshar Drawer Toggle */}
+        <button
+          onClick={() => setShowKeymap((prev) => !prev)}
+          title={
+            showKeymap
+              ? "Hide Keymap & Juktakshar Chart"
+              : "Show Keymap & Juktakshar Chart"
+          }
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: "26px",
+            height: "26px",
+            borderRadius: "9999px",
+            backgroundColor: showKeymap
+              ? "rgba(245, 158, 11, 0.25)"
+              : "#18181b",
+            border: showKeymap
+              ? "1px solid rgba(245, 158, 11, 0.6)"
+              : "1px solid #27272a",
+            color: showKeymap ? "#fcd34d" : "#a1a1aa",
+            cursor: "pointer",
+            transition: "all 0.15s ease",
+          }}
+        >
+          <LayoutGrid className="w-3.5 h-3.5" />
+        </button>
 
-          <button
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={() => getCurrentWindow().close()}
-            title="Exit AsomIME"
-            className="w-6 h-6 rounded-full flex items-center justify-center text-zinc-400 hover:text-rose-400 hover:bg-rose-500/10 text-xs transition cursor-pointer"
-          >
-            ✕
-          </button>
-        </div>
+        {/* Minimize Button */}
+        <button
+          onClick={handleMinimize}
+          title="Minimize Toolbar"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: "24px",
+            height: "24px",
+            borderRadius: "9999px",
+            backgroundColor: "transparent",
+            border: "none",
+            color: "#71717a",
+            cursor: "pointer",
+          }}
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
       </div>
 
-      {/* Expandable Frosted Glass Keymap & Juktakshar Drawer */}
-      {showChart && (
+      {/* Expandable Keymap & Juktakshar Drawer */}
+      {showKeymap && (
         <div
-          onMouseDown={(e) => e.preventDefault()}
-          className="mt-1.5 flex-1 glass-shell text-zinc-100 border border-white/10 rounded-2xl p-3 flex flex-col justify-between overflow-hidden"
+          style={{
+            marginTop: "8px",
+            width: "526px",
+            maxWidth: "100%",
+            borderRadius: "16px",
+            backgroundColor: "rgba(9, 9, 11, 0.96)",
+            border: "1px solid #27272a",
+            padding: "12px",
+            boxSizing: "border-box",
+            boxShadow: "0 16px 40px rgba(0, 0, 0, 0.75)",
+            backdropFilter: "blur(16px)",
+            fontSize: "12px",
+          }}
         >
-          {/* Header Legend */}
-          <div className="flex justify-between items-center text-xs text-zinc-400 px-1 pb-1 border-b border-white/5">
-            <span className="font-medium text-zinc-300">
-              {state.layout === "phonetic"
-                ? "Phonetic: k → ক, Shift+K → খ"
-                : "Smart: K → ক, Kh → খ"}{" "}
-              <span className="text-amber-400">
-                ({activeFontObj?.family_name ?? "Unicode"})
-              </span>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              paddingBottom: "8px",
+              marginBottom: "8px",
+              borderBottom: "1px solid #27272a",
+            }}
+          >
+            <span style={{ fontWeight: 700, color: "#fbbf24" }}>
+              Pranab Keyboard — Keymap & Juktakshar Chart
             </span>
-            <div className="flex items-center gap-3">
-              <span>
-                <span className="text-amber-400 font-semibold">Top-Right</span>:
-                Shift
-              </span>
-              <span>
-                <span className="text-emerald-400 font-semibold">Center</span>:
-                Normal
-              </span>
-              <span className="text-xs px-1.5 py-0.5 rounded bg-white/5 text-zinc-400">
-                Ctrl + Space
-              </span>
-            </div>
+            <span style={{ fontSize: "11px", color: "#a1a1aa" }}>
+              App: <strong style={{ color: "#e4e4e7" }}>{imeState.active_app}</strong> · Shortcut:{" "}
+              <kbd
+                style={{
+                  padding: "2px 6px",
+                  backgroundColor: "#27272a",
+                  borderRadius: "4px",
+                  color: "#e4e4e7",
+                }}
+              >
+                Ctrl+Space
+              </kbd>
+            </span>
           </div>
 
-          {/* Visual Keyboard Rows */}
-          <div className="space-y-1 py-1">
-            {KEY_ROWS.map((row, rIdx) => (
-              <div key={rIdx} className="flex justify-center gap-1">
-                {row.map((k) => (
-                  <div
-                    key={k.en}
-                    className="group flex flex-col justify-between bg-zinc-900/90 hover:bg-zinc-800/95 border border-white/10 hover:border-orange-500/50 rounded-lg px-1.5 py-1 min-w-9 transition-all"
-                  >
-                    <div className="w-full flex justify-between items-center text-xs leading-none">
-                      <span className="text-zinc-500 font-mono">{k.en}</span>
-                      <button
-                        onMouseDown={(e) => e.preventDefault()}
-                        onClick={() => handleVirtualClick(k.shift)}
-                        className="text-amber-400 hover:text-amber-300 font-bold hover:scale-125 transition cursor-pointer"
-                        title={`Shift + ${k.en} → ${k.shift}`}
-                      >
-                        {k.shift}
-                      </button>
-                    </div>
-                    <button
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => handleVirtualClick(k.normal)}
-                      className="text-xs text-emerald-300 hover:text-emerald-200 font-bold leading-tight mt-0.5 hover:scale-110 transition cursor-pointer"
-                      title={`${k.en} → ${k.normal}`}
-                    >
-                      {k.normal === "্" ? "Link" : k.normal}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ))}
-          </div>
-
-          {/* Quick Juktakshar (Conjunct) Strip */}
-          <div className="pt-1.5 border-t border-white/10">
-            <div className="flex justify-between items-center mb-1 px-1">
-              <span className="text-xs font-medium uppercase tracking-wider text-zinc-400">
-                Quick Juktakshar (Conjuncts)
-              </span>
-              <span className="text-xs text-amber-400/90">
-                App: {state.active_app}
-              </span>
+          {/* Clickable Conjuncts */}
+          <div style={{ marginBottom: "10px" }}>
+            <div
+              style={{
+                fontSize: "11px",
+                color: "#a1a1aa",
+                marginBottom: "6px",
+              }}
+            >
+              Click to insert Juktakshar:
             </div>
-            <div className="flex flex-wrap gap-1 justify-center">
-              {JUKTAKSHARS.map((juk) => (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(5, 1fr)",
+                gap: "6px",
+              }}
+            >
+              {CONJUNCTS.map((c) => (
                 <button
-                  key={juk}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => handleVirtualClick(juk)}
-                  className="px-2 py-0.5 bg-zinc-900 hover:bg-linear-to-r hover:from-orange-500 hover:to-amber-500 hover:text-zinc-950 text-zinc-200 rounded-md text-xs font-semibold border border-white/10 hover:border-transparent transition-all cursor-pointer"
+                  key={c.label}
+                  onClick={() => handleInject(c.seq)}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    padding: "4px 6px",
+                    borderRadius: "8px",
+                    backgroundColor: "#18181b",
+                    border: "1px solid #27272a",
+                    color: "#f4f4f5",
+                    cursor: "pointer",
+                  }}
                 >
-                  {juk}
+                  <span style={{ fontSize: "15px", fontWeight: 600 }}>
+                    {c.label}
+                  </span>
+                  <span style={{ fontSize: "10px", color: "#a1a1aa" }}>
+                    {c.hint}
+                  </span>
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* Keymap Grid */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, 1fr)",
+              gap: "6px",
+              paddingTop: "8px",
+              borderTop: "1px solid #27272a",
+            }}
+          >
+            {PHONETIC_HINTS.map((item) => (
+              <div
+                key={item.key}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  padding: "4px 8px",
+                  borderRadius: "6px",
+                  backgroundColor: "#18181b",
+                  border: "1px solid rgba(39, 39, 42, 0.7)",
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: "monospace",
+                    fontSize: "11px",
+                    color: "#fcd34d",
+                  }}
+                >
+                  {item.key}
+                </span>
+                <span style={{ fontWeight: 600, color: "#f4f4f5" }}>
+                  {item.out}
+                </span>
+              </div>
+            ))}
           </div>
         </div>
       )}

@@ -1,0 +1,10 @@
+Pranab Keyboard — Third-Party Open Source Software Notices
+
+This proprietary software incorporates components from the following open-source
+projects, licensed under the MIT, Apache-2.0, or ISC licenses:
+
+- Tauri Framework (MIT / Apache-2.0)
+- React & React DOM (MIT)
+- Tailwind CSS (MIT)
+- Lucide Icons (ISC)
+- Rust Crates: write-fonts, ttf-parser, once_cell, serde, serde_json, windows (MIT / Apache-2.0)
