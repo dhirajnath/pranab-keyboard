@@ -2713,7 +2713,6 @@ name = "pranab-keyboard"
 version = "0.1.0"
 dependencies = [
  "once_cell",
- "read-fonts",
  "serde",
  "serde_json",
  "tauri",
